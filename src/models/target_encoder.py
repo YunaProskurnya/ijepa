@@ -16,7 +16,8 @@ def create_target_encoder(encoder):
     return target_encoder
 
 
-def prepare_targets(target_encoder, images, target_indices, *, joint=False, return_features=False):
+def prepare_targets(target_encoder, images, target_indices, *, joint=False, return_features=False,
+                    noise_std=0.0):
     """Полное изображение -> нормализованные цели [B,Nt,D]"""
     multiple = isinstance(target_indices, list)
     blocks = target_indices if multiple else [target_indices]
@@ -30,6 +31,8 @@ def prepare_targets(target_encoder, images, target_indices, *, joint=False, retu
     with nullcontext() if joint else torch.no_grad():
         features = target_encoder(images)
         normalized = F.layer_norm(features, (features.shape[-1],), eps=1e-5)
+        if noise_std:
+            normalized = normalized + noise_std * torch.randn_like(normalized)
         targets = [select_tokens(normalized, indices) for indices in blocks]
     targets = targets if multiple else targets[0]
     return (targets, features) if return_features else targets

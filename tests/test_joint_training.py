@@ -3,9 +3,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from src.models.encoder import VisionTransformer
 from src.models.predictor import VisionTransformerPredictor
+from src.models.token_selection import select_tokens
 from src.losses import prediction_loss
 from src.optimizer import create_optimizer
 from src.train_step import train_step
@@ -42,26 +44,35 @@ class TestJointTraining(unittest.TestCase):
         self.assertGreater(metrics["grad_norm"], 0)
         self.assertAlmostEqual(metrics["loss"], metrics["prediction_loss"])
 
-    def test_noise_changes_context_seen_by_predictor(self):
+    def test_noise_changes_targets_but_not_context(self):
         encoder_outputs = []
         predictor_inputs = []
+        loss_targets = []
         encoder_hook = self.encoder.register_forward_hook(
             lambda _, __, output: encoder_outputs.append(output.detach().clone())
         )
         predictor_hook = self.predictor.predictor_embed.register_forward_pre_hook(
             lambda _, inputs: predictor_inputs.append(inputs[0].detach().clone())
         )
+
+        def capture_loss(predictions, targets, loss_type):
+            loss_targets.extend(target.detach().clone() for target in targets)
+            return prediction_loss(predictions, targets, loss_type)
+
         try:
-            metrics = self.step(weight=0, prediction_loss_type="mse", noise_std=0.5,
-                                precision="bf16")
+            with patch("src.train_step.prediction_loss", side_effect=capture_loss):
+                metrics = self.step(weight=0, prediction_loss_type="mse", noise_std=0.5,
+                                    precision="bf16")
         finally:
             encoder_hook.remove()
             predictor_hook.remove()
 
         self.assertEqual(len(encoder_outputs), 2)
         self.assertEqual(len(predictor_inputs), 1)
-        self.assertEqual(encoder_outputs[1].shape, predictor_inputs[0].shape)
-        self.assertGreater((predictor_inputs[0] - encoder_outputs[1]).abs().sum().item(), 0)
+        torch.testing.assert_close(predictor_inputs[0], encoder_outputs[1], rtol=0, atol=0)
+        clean = F.layer_norm(encoder_outputs[0], (encoder_outputs[0].shape[-1],), eps=1e-5)
+        clean = select_tokens(clean, self.targets[0])
+        self.assertGreater((loss_targets[0] - clean).abs().sum().item(), 0.5)
         self.assertGreater(metrics["grad_norm"], 0)
 
     def test_invalid_noise_and_loss_are_rejected(self):

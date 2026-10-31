@@ -75,7 +75,8 @@ def parse_args(argv=None):
     parser.add_argument("--regularizer", choices=("none", "sigreg", "visreg"))
     parser.add_argument("--regularizer-weight", type=float, default=0.02)
     parser.add_argument("--prediction-loss-type", choices=("smooth_l1", "mse"), default="smooth_l1")
-    parser.add_argument("--noise-std", type=float, default=0.0)
+    parser.add_argument("--noise-std", type=float, default=0.0,
+                        help="Gaussian noise on normalized full-image targets before selecting patches")
     args = parse_config_args(parser, argv)
     if args.regularizer is None:
         args.regularizer = "sigreg" if args.mode == "joint" else "none"
@@ -260,8 +261,8 @@ def main():
     if args.prediction_loss_type == "mse":
         config["objective"].update(loss="mse", beta=None)
     if args.noise_std:
-        config["objective"].update(context_noise="independent Gaussian after context encoder",
-                                   context_noise_std=args.noise_std)
+        config["objective"].update(target_noise="independent Gaussian after target normalization",
+                                   target_noise_std=args.noise_std)
     if args.mode == "joint":
         config["objective"].update(
             regularizer=args.regularizer, regularizer_weight=args.regularizer_weight,
