@@ -54,9 +54,25 @@ def train_step(encoder, predictor, target_encoder, optimizer,
         trainable_params = []
         for group in optimizer.param_groups:
             trainable_params.extend(group["params"])
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            trainable_params, max_norm=float("inf"), error_if_nonfinite=True,
-        ).item()
+        try:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_params, max_norm=float("inf"), error_if_nonfinite=True,
+            ).item()
+        except RuntimeError as error:
+            if "non-finite" not in str(error):
+                raise
+            bad_gradients = [
+                f"{module_name}.{name}"
+                for module_name, module in (("encoder", encoder), ("predictor", predictor))
+                for name, parameter in module.named_parameters()
+                if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+            ]
+            raise RuntimeError(
+                f"Non-finite gradient norm: loss={loss.item():.6g}, "
+                f"prediction={prediction.item():.6g}, "
+                f"regularization={regularization.item() if regularizer != 'none' else 0:.6g}, "
+                f"parameters={bad_gradients or 'individual gradients are finite'}"
+            ) from error
 
         optimizer.step()
         if mode == "ema":
