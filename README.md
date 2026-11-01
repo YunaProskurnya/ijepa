@@ -24,7 +24,7 @@ python scripts/train.py --config configs/smoke.json
 
 ## Comet
 
-Comet включён для каждого запуска в `superustam/rejepa`. Загрузите локальный API key:
+Comet включён по умолчанию в `superustam/rejepa`. Загрузите локальный API key:
 
 ```sh
 source .venv/bin/activate
@@ -38,8 +38,9 @@ python scripts/train.py --config configs/imagenet100_vit_base.json
 В Comet отправляются параметры запуска, метрики каждого шага и финальные
 веса encoder, predictor и target encoder через
 [`log_model`](https://www.comet.com/docs/v2/integrations/ml-frameworks/pytorch/).
-Без `COMET_API_KEY` обучение не запускается. Флагов включения и отключения Comet нет.
-Каждый запуск, включая smoke test и `--resume`, создаёт отдельный Comet experiment.
+Без `COMET_API_KEY` обучение запускается с `--no-comet`; параметры, метрики и checkpoint
+сохраняются локально, но не отправляются в Comet. Без этого флага ключ обязателен.
+При включённом Comet каждый запуск, включая smoke test и `--resume`, создаёт отдельный experiment.
 
 ## ImageNet100
 

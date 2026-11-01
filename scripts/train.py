@@ -9,8 +9,12 @@ import shutil
 import sys
 import time
 
-from comet_ml import start
-from comet_ml.integration.pytorch import log_model
+try:
+    from comet_ml import start
+    from comet_ml.integration.pytorch import log_model
+except ImportError:
+    start = None
+    log_model = None
 import numpy as np
 import PIL
 import torch
@@ -51,6 +55,7 @@ def resume_config(config):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Single-device I-JEPA training")
     parser.add_argument("--config", type=Path, help="JSON experiment settings; CLI options take precedence")
+    parser.add_argument("--comet", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--data", type=Path)
     parser.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dataset", choices=("imagefolder", "cifar10"), default="imagefolder")
@@ -68,6 +73,8 @@ def parse_args(argv=None):
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--checkpoint-epoch-every", type=int, default=1)
+    parser.add_argument("--epoch-checkpoints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-seconds", type=float)
     parser.add_argument("--benchmark-warmup", type=int, default=5)
@@ -97,8 +104,9 @@ def parse_args(argv=None):
         parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("max-steps must be positive")
-    if args.accumulation_steps <= 0 or args.checkpoint_every <= 0 or args.benchmark_warmup < 0:
-        parser.error("accumulation-steps/checkpoint-every must be positive; benchmark-warmup nonnegative")
+    if (args.accumulation_steps <= 0 or args.checkpoint_every <= 0 or
+            args.checkpoint_epoch_every <= 0 or args.benchmark_warmup < 0):
+        parser.error("accumulation-steps/checkpoint intervals must be positive; benchmark-warmup nonnegative")
     if args.max_seconds is not None and not 0 < args.max_seconds < float("inf"):
         parser.error("max-seconds must be finite and positive")
     if args.class_subset_count is not None and (
@@ -128,8 +136,10 @@ def parse_args(argv=None):
 def main():
     parser, args = parse_args()
 
-    if not os.environ.get("COMET_API_KEY"):
+    if args.comet and not os.environ.get("COMET_API_KEY"):
         parser.error("COMET_API_KEY is required; source .env before running")
+    if args.comet and start is None:
+        parser.error("comet_ml is required; install it or pass --no-comet")
 
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32))
@@ -357,8 +367,10 @@ def main():
     if representation_loader is not None:
         representation_output.mkdir(exist_ok=True)
         settings_path.write_text(json.dumps(representation_settings, indent=2), encoding="utf-8")
-    experiment = start(api_key=os.environ["COMET_API_KEY"], project_name="rejepa", workspace="superustam")
-    experiment.log_parameters(config)
+    experiment = None
+    if args.comet:
+        experiment = start(api_key=os.environ["COMET_API_KEY"], project_name="rejepa", workspace="superustam")
+        experiment.log_parameters(config)
     if args.smoke_test:
         print("Synthetic images: checks execution only, not representation quality.", flush=True)
     print(f"model={args.model} collator={args.collator} device={device} precision={args.precision} images={len(dataset)} "
@@ -529,8 +541,9 @@ def main():
                     row["target_tokens"] = int(row["target_tokens"])
                 writer.writerow(row)
                 log.flush()
-                experiment.log_metrics({key: value for key, value in row.items() if value is not None},
-                                       step=step, epoch=epoch + 1)
+                if experiment is not None:
+                    experiment.log_metrics({key: value for key, value in row.items() if value is not None},
+                                           step=step, epoch=epoch + 1)
                 print(f"step={step} epoch={epoch + 1} loss={row['loss']:.6f} "
                       f"prediction={row['prediction_loss']:.6f} regularization={row['regularization_loss']:.6f} "
                       f"context={row['context_tokens']:g} target={row['target_tokens']:g} "
@@ -546,7 +559,10 @@ def main():
                     stop_reason = "max-steps reached"
                     break
             finished_epoch = next_epoch == epoch + 1 and next_batch == 0
-            save_checkpoint(completed_epoch=epoch if finished_epoch else None)
+            if stop or finished_epoch and (
+                (epoch + 1) % args.checkpoint_epoch_every == 0 or epoch + 1 == args.epochs
+            ):
+                save_checkpoint(completed_epoch=epoch if finished_epoch and args.epoch_checkpoints else None)
             del iterator
             if finished_epoch:
                 record_representation(epoch)
@@ -557,11 +573,12 @@ def main():
         print(f"Steady throughput excluding {args.benchmark_warmup} warmup updates and checkpoint writes: "
               f"{measured_images / measured_seconds:.2f} images/s", flush=True)
     print(f"Saved configuration, metrics and checkpoint to {args.output.resolve()}", flush=True)
-    model_state = {"encoder": encoder.state_dict(), "predictor": predictor.state_dict()}
-    if target_encoder is not None:
-        model_state["target_encoder"] = target_encoder.state_dict()
-    log_model(experiment, model_state, model_name="rejepa")
-    experiment.end()
+    if experiment is not None:
+        model_state = {"encoder": encoder.state_dict(), "predictor": predictor.state_dict()}
+        if target_encoder is not None:
+            model_state["target_encoder"] = target_encoder.state_dict()
+        log_model(experiment, model_state, model_name="rejepa")
+        experiment.end()
 
 
 if __name__ == "__main__":

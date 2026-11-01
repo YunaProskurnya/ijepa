@@ -31,11 +31,19 @@ class TestDatasetTraining(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("COMET_API_KEY is required", stderr.getvalue())
 
-    def test_comet_flags_are_removed(self):
-        for flag in ("--comet", "--no-comet"):
-            with self.subTest(flag=flag), redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
-                train.parse_args(["--smoke-test", flag])
-            self.assertEqual(caught.exception.code, 2)
+    def test_no_comet_runs_without_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run"
+            with patch.dict(os.environ, {"COMET_API_KEY": ""}), patch.object(
+                train, "start"
+            ) as start, patch.object(train, "log_model") as log_model, patch.object(
+                sys, "argv", ["train.py", "--smoke-test", "--no-comet", "--max-steps", "1",
+                              "--output", str(output)]
+            ):
+                train.main()
+            start.assert_not_called()
+            log_model.assert_not_called()
+            self.assertTrue((output / "checkpoint.pt").exists())
 
     def test_comet_logs_parameters_metrics_and_weights(self):
         comet = MagicMock()
