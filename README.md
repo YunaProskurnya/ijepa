@@ -316,6 +316,88 @@ JSON содержит top-1/top-5 accuracy, прирост top-1 в процен
 сохраняйте одинаковые данные и параметры оценки. kNN не заменяет linear probe
 из статьи.
 
+## Итоговый linear probe: EMA, SIGReg и VISReg
+
+В [configs/linear_probe_cached.json](configs/linear_probe_cached.json) измените
+`checkpoint`, `train`, `val`, `cache` и `output` на пути вашего запуска.
+На сервере с датасетом в корне проекта укажите `"train": "train"`, `"val": "val"`.
+Для каждого checkpoint нужна отдельная папка кэша.
+
+```sh
+# Один раз: признаки 50 случайных crop/flip каждого train-изображения
+# и фиксированные признаки train/val для подсчёта итоговых метрик.
+python scripts/prepare_linear_cache.py --config configs/linear_probe_cached.json
+
+# Только линейные головы, без повторных проходов encoder.
+python scripts/evaluate_linear_cached.py --config configs/linear_probe_cached.json
+```
+
+Скрипт оценивает замороженный encoder: EMA target для I-JEPA или общий encoder
+для SIGReg/VISReg. Кэш содержит признаки одного checkpoint и позволяет повторять
+оценку без новых проходов encoder. Для другого checkpoint нужен отдельный кэш.
+Итоговая оценка перебирает 24 варианта голов (12 для маленького encoder с менее
+чем четырьмя блоками), обучает их LARS 50 эпох и выбирает лучшую по val top-1.
+Comet для оценки по умолчанию отключён; подготовка признаков занимает время.
+
+| Файл | Содержимое |
+| --- | --- |
+| `linear_cached.best.md` | Читаемый лучший результат с параметрами и train/val accuracy и loss |
+| `linear_cached.best.json` | Лучший результат для программного чтения |
+| `linear_cached.trials.csv` | Все варианты таблицей |
+| `linear_cached.json` | Полный протокол и метрики |
+
+## Кривая лёгкого linear probe по сохранённым эпохам
+
+[configs/linear_probe_curve.json](configs/linear_probe_curve.json) задаёт папку
+`checkpoints`, пути `train` / `val` и отдельную папку `output` для результатов.
+Один запуск оценивает одну обученную модель (EMA, SIGReg или VISReg):
+
+```sh
+python scripts/evaluate_linear_curve.py --config configs/linear_probe_curve.json
+```
+
+По умолчанию проверяются **все сохранённые эпохи**. `every: 10` оставит первую,
+последнюю и каждую десятую завершённую эпоху. Поддерживаются `checkpoint_0.pt`
+(первая эпоха в training loop из main) и `checkpoint_epoch_0010.pt`
+(десятая эпоха в experiment-monitoring). Перезаписываемый `checkpoint.pt` не включается.
+
+Для скорости фиксируются до 100 train-изображений каждого класса и весь val:
+для ImageNet100 это около 10 тысяч train и 5 тысяч val. Список выбранных файлов
+сохраняется в `selection.json` и одинаков для всех checkpoint и методов при одинаковых
+данных, классах и seed. `train_per_class: 0` включает весь train;
+`val_per_class: 0` включает весь val. Для каждого checkpoint encoder один раз
+обрабатывает выбранные train/val; признаки хранятся в RAM только для текущей точки.
+Голова каждый раз инициализируется заново с одинаковым seed: mean последнего слоя,
+Linear с bias, Adam, LR 0.001, 30 эпох, batch 256. Перебора и переноса весов головы нет.
+
+Это **лёгкий диагностический probe**, его accuracy не равна итоговой оценке LARS
+из раздела выше. На оси X — эпоха предобучения encoder, а не эпоха обучения головы.
+Используйте одинаковые настройки и данные для сравнения методов.
+
+В `output` сохраняются `linear_curve.csv` (train/val accuracy, loss, эпоха, шаг,
+время каждой точки), `settings.json`, `selection.json` и графики
+`linear_curve.png` / `linear_curve.svg`. CSV обновляется после каждой точки.
+Повторная команда пропускает готовые checkpoint и продолжает работу;
+при изменении данных, настроек или уже оценённых файлов требует новую папку.
+Её можно повторно запускать и во время предобучения: будут добавлены новые
+сохранённые checkpoint. Скрипт завершается после обработки найденных файлов;
+автоматического ожидания следующей эпохи нет. На общей GPU оценка потребляет
+вычислительные ресурсы и может замедлить предобучение.
+Можно менять `every`, чтобы постепенно дополнить редкую кривую. Во время работы
+выводятся время точки и оценка оставшегося времени. Даже лёгкий probe по сотням
+checkpoint требует времени: сначала оцените несколько эпох с `every: 50`.
+Comet и API key не нужны. Для графиков установите обновлённый `requirements.txt`.
+
+Сравнение готовых кривых для презентации без GPU:
+
+```sh
+python scripts/plot_linear_curves.py \
+  --csv runs/ema/linear_curve/linear_curve.csv \
+        runs/sigreg/linear_curve/linear_curve.csv \
+        runs/visreg/linear_curve/linear_curve.csv \
+  --labels EMA SIGReg VISReg --output runs/linear_probe_comparison
+```
+
 ## Где читать и менять код
 
 `src/` содержит метод, `scripts/` — рабочие запуски обучения и оценки,
@@ -327,6 +409,8 @@ JSON содержит top-1/top-5 accuracy, прирост top-1 в процен
 - `src/optimizer.py` и `src/losses.py` — группы параметров AdamW и функция потерь.
 - `scripts/train.py` — параметры, DataLoader, цикл, расписания и сохранение.
 - `scripts/evaluate_knn.py` — оценка сохранённой модели.
+- `scripts/prepare_linear_cache.py`, `scripts/evaluate_linear_cached.py` — подготовка признаков и итоговый linear probe.
+- `src/linear_probe_final.py` — общий протокол LARS; `src/linear_probe_cache.py` — дисковый кэш.
 - `scripts/setup_imagenet100.sh` — команды команды для скачивания и раскладки ImageNet100.
 - `src/config.py` — чтение JSON и проверка настроек запуска.
 - `src/reference/` — авторские collator и расписания LR/weight decay.
