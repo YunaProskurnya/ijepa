@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - override /system: smoke
+
+training:
+  collator: custom
+  model: tiny
+  batch_size: 2
+  epochs: 1
+  max_steps: null
+  seed: 0

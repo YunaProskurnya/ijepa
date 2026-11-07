@@ -1,0 +1,10 @@
+defaults:
+  - default
+
+smoke_test: true
+device: cpu
+precision: fp32
+num_workers: 0
+data: null
+representation_data: null
+tracker: none
