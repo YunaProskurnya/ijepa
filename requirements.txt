@@ -5,5 +5,6 @@ numpy
 Pillow
 matplotlib>=3.7
 comet_ml>=3.49
+clearml
 
 kaggle
