@@ -2,11 +2,11 @@ import argparse
 import csv
 import json
 import math
-from pathlib import Path
 import random
 import shutil
 import sys
 import time
+from pathlib import Path
 
 import hydra
 import numpy as np
@@ -21,6 +21,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.datasets.imagenet100 import (
     MaskCollator as CustomMaskCollator,
+)
+from src.datasets.imagenet100 import (
     make_data_loader,
 )
 from src.models.encoder import VisionTransformer
@@ -38,7 +40,6 @@ from src.representation_diagnostics import (
 from src.run_tracker import start_run_tracker
 from src.train_step import train_step
 from src.transforms import IMAGENET_NORMALIZE
-
 
 PATHS = ("data", "output", "resume", "representation_data")
 INTS = (
@@ -104,16 +105,19 @@ def run(parser, args):
     if device.type == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
 
-    crop_options = dict(
-        size=224,
-        scale=(0.3, 1.0),
-        ratio=(0.75, 4 / 3),
-        interpolation=transforms.InterpolationMode.BILINEAR,
-        antialias=True,
-    )
+    crop_size = 224
+    crop_scale = (0.3, 1.0)
+    crop_ratio = (0.75, 4 / 3)
+    crop_interpolation = transforms.InterpolationMode.BILINEAR
     transform = transforms.Compose(
         [
-            transforms.RandomResizedCrop(**crop_options),
+            transforms.RandomResizedCrop(
+                size=crop_size,
+                scale=crop_scale,
+                ratio=crop_ratio,
+                interpolation=crop_interpolation,
+                antialias=True,
+            ),
             transforms.ToTensor(),
             transforms.Normalize(**IMAGENET_NORMALIZE),
         ]
@@ -158,17 +162,17 @@ def run(parser, args):
                 name: index for index, name in enumerate(selected_classes)
             }
 
-    mask_options = dict(
-        input_size=224,
-        patch_size=16,
-        enc_mask_scale=(0.85, 1.0),
-        pred_mask_scale=(0.15, 0.2),
-        aspect_ratio=(0.75, 1.5),
-        nenc=1,
-        npred=4,
-        min_keep=10,
-        allow_overlap=False,
-    )
+    mask_options = {
+        "input_size": 224,
+        "patch_size": 16,
+        "enc_mask_scale": (0.85, 1.0),
+        "pred_mask_scale": (0.15, 0.2),
+        "aspect_ratio": (0.75, 1.5),
+        "nenc": 1,
+        "npred": 4,
+        "min_keep": 10,
+        "allow_overlap": False,
+    }
     if args.collator == "reference":
         collator = ReferenceMaskCollator(**mask_options)
     else:
@@ -190,7 +194,12 @@ def run(parser, args):
         "vit_base": (768, 12, 12, 384, 6),
         "vit_large": (1024, 24, 16, 384, 12),
     }[args.model]
-    transformer_options = dict(mlp_ratio=4.0, qkv_bias=True, drop=0.0, attn_drop=0.0)
+    transformer_options = {
+        "mlp_ratio": 4.0,
+        "qkv_bias": True,
+        "drop": 0.0,
+        "attn_drop": 0.0,
+    }
     model_options = dict(
         image_size=224,
         patch_size=16,
@@ -274,68 +283,74 @@ def run(parser, args):
         effective_batch_size=args.batch_size * args.accumulation_steps,
         reference_commit="52c1ae95d05f743e000e8f10a1f3a79b10cff048",
     )
-    config.update(
-        preprocessing=dict(
-            random_resized_crop={
-                **crop_options,
-                "interpolation": crop_options["interpolation"].value,
-            },
-            to_tensor=True,
-            normalize=IMAGENET_NORMALIZE,
-        ),
-        optimizer=dict(
-            name="AdamW",
-            defaults=optimizer.defaults,
-            no_decay="parameter name contains 'bias' or parameter.ndim == 1",
-        ),
-        objective=dict(
-            loss="smooth_l1",
-            beta=1.0,
-            reduction="mean per block, then mean across blocks",
-            target_normalization="layer_norm over features",
-            target_norm_eps=1e-5,
-            target_update="EMA after optimizer.step"
-            if args.mode == "ema"
-            else "joint shared encoder",
-            gradient_clipping=None,
-        ),
-        schedules=dict(
-            lr="warmup_cosine",
-            weight_decay="cosine",
-            ema="linear" if args.mode == "ema" else "none",
-            unit="optimizer update",
-            warmup_steps=args.warmup_epochs * updates_per_epoch,
-            total_steps=total_steps,
-        ),
-        architecture=dict(
-            position_embedding="fixed_2d_sincos",
-            layer_norm_eps=1e-6,
-            initialization_std=0.02,
-            residual_rescale="1 / sqrt(2 * layer_index)",
-            attention="scaled_dot_product_attention",
-            stochastic_depth=0.0,
-        ),
-        data_loader=dict(
-            drop_last=True,
-            persistent_workers=False,
-            sampler="randperm with seed + epoch",
-            pin_memory=device.type == "cuda",
-        ),
-        smoke_data=dict(size=8, image_size=(3, 256, 256)) if args.smoke_test else None,
-        versions=dict(
-            python=sys.version.split()[0],
-            torchvision=str(torchvision.__version__),
-            numpy=np.__version__,
-            pillow=PIL.__version__,
-        ),
-    )
+    objective = {
+        "loss": "smooth_l1",
+        "beta": 1.0,
+        "reduction": "mean per block, then mean across blocks",
+        "target_normalization": "layer_norm over features",
+        "target_norm_eps": 1e-5,
+        "target_update": "EMA after optimizer.step"
+        if args.mode == "ema"
+        else "joint shared encoder",
+        "gradient_clipping": None,
+    }
     if args.mode == "joint":
-        config["objective"].update(
+        objective.update(
             regularizer=args.regularizer,
             regularizer_weight=args.regularizer_weight,
             regularizer_input="full-image encoder patch embeddings before target normalization",
             regularizer_reduction="mean over patch positions after regularizing across batch",
         )
+    config.update(
+        preprocessing={
+            "random_resized_crop": {
+                "size": crop_size,
+                "scale": crop_scale,
+                "ratio": crop_ratio,
+                "interpolation": crop_interpolation.value,
+                "antialias": True,
+            },
+            "to_tensor": True,
+            "normalize": IMAGENET_NORMALIZE,
+        },
+        optimizer={
+            "name": "AdamW",
+            "defaults": optimizer.defaults,
+            "no_decay": "parameter name contains 'bias' or parameter.ndim == 1",
+        },
+        objective=objective,
+        schedules={
+            "lr": "warmup_cosine",
+            "weight_decay": "cosine",
+            "ema": "linear" if args.mode == "ema" else "none",
+            "unit": "optimizer update",
+            "warmup_steps": args.warmup_epochs * updates_per_epoch,
+            "total_steps": total_steps,
+        },
+        architecture={
+            "position_embedding": "fixed_2d_sincos",
+            "layer_norm_eps": 1e-6,
+            "initialization_std": 0.02,
+            "residual_rescale": "1 / sqrt(2 * layer_index)",
+            "attention": "scaled_dot_product_attention",
+            "stochastic_depth": 0.0,
+        },
+        data_loader={
+            "drop_last": True,
+            "persistent_workers": False,
+            "sampler": "randperm with seed + epoch",
+            "pin_memory": device.type == "cuda",
+        },
+        smoke_data={"size": 8, "image_size": (3, 256, 256)}
+        if args.smoke_test
+        else None,
+        versions={
+            "python": sys.version.split()[0],
+            "torchvision": str(torchvision.__version__),
+            "numpy": np.__version__,
+            "pillow": PIL.__version__,
+        },
+    )
     for key in ("data", "output", "resume"):
         value = getattr(args, key)
         if value is not None:
@@ -385,13 +400,13 @@ def run(parser, args):
             "architecture",
             "smoke_data",
         )
-        defaults = dict(
-            mode="ema",
-            regularizer="none",
-            regularizer_weight=0.02,
-            representation_data=None,
-            representation_samples=1024,
-        )
+        defaults = {
+            "mode": "ema",
+            "regularizer": "none",
+            "regularizer_weight": 0.02,
+            "representation_data": None,
+            "representation_samples": 1024,
+        }
         saved_config = resume_config(checkpoint["config"])
         requested_config = resume_config(config)
         differences = [
@@ -456,11 +471,11 @@ def run(parser, args):
     representation_every = 25
     representation_output = args.output / "representation_analysis"
     if representation_loader is not None:
-        representation_settings = dict(
-            paths=representation_paths,
-            every=representation_every,
-            encoder_source="encoder" if args.mode == "joint" else "target_encoder",
-        )
+        representation_settings = {
+            "paths": representation_paths,
+            "every": representation_every,
+            "encoder_source": "encoder" if args.mode == "joint" else "target_encoder",
+        }
         if args.mode == "joint":
             representation_settings.update(
                 regularizer=args.regularizer, regularizer_weight=args.regularizer_weight
@@ -569,6 +584,9 @@ def run(parser, args):
         ):
             return
         representation_encoder = encoder if args.mode == "joint" else target_encoder
+        if representation_encoder is None:
+            parser.error("representation analysis requires ema or joint mode")
+            return
         representation_encoder.eval()
         statistics = evaluate_representation(
             representation_encoder,
@@ -728,32 +746,37 @@ def run(parser, args):
                 remaining_images = (
                     (args.epochs - next_epoch) * batches_per_epoch - next_batch
                 ) * args.batch_size
-                row = dict(
-                    step=step,
-                    epoch=epoch + 1,
-                    loss=loss_sum / group_size,
-                    prediction_loss=prediction_sum / group_size,
-                    regularization_loss=regularization_sum / group_size,
-                    grad_norm=metrics["grad_norm"],
-                    lr=lr,
-                    weight_decay=weight_decay,
-                    momentum=momentum,
-                    context_tokens=context_sum / group_size,
-                    target_tokens=target_sum / group_size,
-                    images=update_images,
-                    step_seconds=seconds,
-                    images_per_second=update_images / seconds,
-                    steady_images_per_second=throughput,
-                    eta_seconds=remaining_images / throughput if throughput else None,
-                    cuda_peak_memory_mb=torch.cuda.max_memory_allocated(device) / 2**20
+                context_tokens = context_sum / group_size
+                target_tokens = target_sum / group_size
+                if group_size == 1:
+                    context_tokens = int(context_tokens)
+                    target_tokens = int(target_tokens)
+                row = {
+                    "step": step,
+                    "epoch": epoch + 1,
+                    "loss": loss_sum / group_size,
+                    "prediction_loss": prediction_sum / group_size,
+                    "regularization_loss": regularization_sum / group_size,
+                    "grad_norm": metrics["grad_norm"],
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "momentum": momentum,
+                    "context_tokens": context_tokens,
+                    "target_tokens": target_tokens,
+                    "images": update_images,
+                    "step_seconds": seconds,
+                    "images_per_second": update_images / seconds,
+                    "steady_images_per_second": throughput,
+                    "eta_seconds": remaining_images / throughput
+                    if throughput
+                    else None,
+                    "cuda_peak_memory_mb": torch.cuda.max_memory_allocated(device)
+                    / 2**20
                     if device.type == "cuda"
                     else 0,
-                    elapsed_seconds=time.perf_counter() - session_start,
-                    warmup=warmup,
-                )
-                if group_size == 1:
-                    row["context_tokens"] = int(row["context_tokens"])
-                    row["target_tokens"] = int(row["target_tokens"])
+                    "elapsed_seconds": time.perf_counter() - session_start,
+                    "warmup": warmup,
+                }
                 writer.writerow(row)
                 log.flush()
                 experiment.log_metrics(
@@ -806,19 +829,35 @@ def run(parser, args):
 @hydra.main(config_path="../configs", config_name="config", version_base="1.3")
 def main(cfg):
     parser = argparse.ArgumentParser(description="Single-device I-JEPA training")
-    values = {
-        **OmegaConf.to_container(cfg.system, resolve=True),
-        **OmegaConf.to_container(cfg.training, resolve=True),
-    }
+    system = OmegaConf.to_container(cfg.system, resolve=True)
+    training = OmegaConf.to_container(cfg.training, resolve=True)
+    if not isinstance(system, dict) or not isinstance(training, dict):
+        parser.error("system and training configs must be mappings")
+        return
+    values = {}
+    for key, item in {**system, **training}.items():
+        if not isinstance(key, str):
+            parser.error("configuration keys must be strings")
+            return
+        values[key] = item
     for key in PATHS:
-        if values[key] is not None:
-            values[key] = Path(str(values[key]))
+        value = values[key]
+        if value is not None:
+            values[key] = Path(str(value))
     for key in INTS:
-        if values[key] is not None:
-            values[key] = int(values[key])
+        value = values[key]
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            parser.error(f"{key} must be an integer")
+        values[key] = int(value)
     for key in FLOATS:
-        if values[key] is not None:
-            values[key] = float(values[key])
+        value = values[key]
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            parser.error(f"{key} must be a float")
+        values[key] = float(value)
     run(parser, argparse.Namespace(**values))
 
 
