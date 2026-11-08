@@ -14,3 +14,6 @@ final_weight_decay: 0.4
 ema_start: 0.996
 ema_end: 1
 seed: 0
+mode: ema
+regularizer: none
+regularizer_weight: 0.02

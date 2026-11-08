@@ -15,13 +15,13 @@ from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = "/home/container/shared/rejepa/runs"
-EXPERIMENTS = ROOT / "configs_hydra" / "experiment"
+EXPERIMENTS = ROOT / "configs" / "experiment"
 
 
 @contextmanager
 def compose_experiment(name):
     GlobalHydra.instance().clear()
-    with initialize_config_dir(config_dir=str(ROOT / "configs_hydra"), version_base="1.3"):
+    with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base="1.3"):
         cfg = compose(
             config_name="config",
             overrides=[f"experiment={name}"],
@@ -69,7 +69,7 @@ class TestHydraConfigs(unittest.TestCase):
             env.pop("CLEARML_API_ACCESS_KEY", None)
             env.pop("CLEARML_API_SECRET_KEY", None)
             result = subprocess.run(
-                [sys.executable, str(ROOT / "scripts/train_hydra.py"),
+                [sys.executable, str(ROOT / "scripts/train.py"),
                  "experiment=smoke", "training.max_steps=1", f"system.output={output}"],
                 cwd=ROOT, capture_output=True, text=True, timeout=120, env=env,
             )

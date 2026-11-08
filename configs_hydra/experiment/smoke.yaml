@@ -6,6 +6,18 @@ training:
   collator: custom
   model: tiny
   batch_size: 2
+  accumulation_steps: 1
   epochs: 1
   max_steps: null
+  warmup_epochs: 0
+  lr: 1.0e-3
+  start_lr: 2.0e-4
+  final_lr: 1.0e-6
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  ema_start: 0.996
+  ema_end: 1.0
   seed: 0
+  mode: ema
+  regularizer: none
+  regularizer_weight: 0.02

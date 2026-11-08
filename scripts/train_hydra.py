@@ -32,34 +32,16 @@ from src.train_step import train_step
 from src.transforms import IMAGENET_NORMALIZE
 
 
-DEFAULTS = dict(
-    data=None, smoke_test=False, dataset="imagefolder", output=None, collator="custom",
-    model="tiny", device="cpu", epochs=1, batch_size=2, num_workers=0, max_steps=None,
-    precision="fp32", compile=False, fused_adamw=False, cudnn_benchmark=False,
-    accumulation_steps=1, checkpoint_every=100, resume=None, max_seconds=None,
-    benchmark_warmup=5, class_subset_count=None, seed=0, lr=1e-3, start_lr=2e-4,
-    final_lr=1e-6, warmup_epochs=0, weight_decay=0.04, final_weight_decay=0.4,
-    ema_start=0.996, ema_end=1.0, representation_data=None, representation_samples=1024,
-    mode="ema", regularizer=None, regularizer_weight=0.02,
-)
 PATHS = ("data", "output", "resume", "representation_data")
 INTS = (
     "epochs", "batch_size", "num_workers", "max_steps", "accumulation_steps",
     "checkpoint_every", "benchmark_warmup", "class_subset_count", "seed",
-    "warmup_epochs", "representation_samples", 
+    "warmup_epochs", "representation_samples",
 )
 FLOATS = (
     "max_seconds", "lr", "start_lr", "final_lr", "weight_decay", "final_weight_decay",
     "ema_start", "ema_end", "regularizer_weight",
 )
-CHOICES = {
-    "dataset": ("imagefolder", "cifar10"),
-    "collator": ("custom", "reference"),
-    "model": ("tiny", "vit_base", "vit_large"),
-    "precision": ("fp32", "bf16"),
-    "mode": ("ema", "joint"),
-    "regularizer": ("none", "sigreg", "visreg"),
-}
 
 
 def seed_worker(worker_id):
@@ -75,74 +57,6 @@ def resume_config(config):
     defaults = {key: value for key, value in optimizer["defaults"].items()
                 if key not in ("fused", "foreach")}
     return {**config, "optimizer": {**optimizer, "defaults": defaults}}
-
-
-def build_args(cfg):
-    system = OmegaConf.to_container(cfg.system, resolve=True)
-    training = OmegaConf.to_container(cfg.training, resolve=True)
-    values = dict(DEFAULTS)
-    for source in (system, training):
-        for key, value in source.items():
-            if key in values:
-                values[key] = value
-    for key in PATHS:
-        if values[key] is not None:
-            values[key] = Path(str(values[key]))
-    for key in INTS:
-        if values[key] is not None:
-            values[key] = int(values[key])
-    for key in FLOATS:
-        if values[key] is not None:
-            values[key] = float(values[key])
-    args = argparse.Namespace(**values)
-    args.config = None
-    args.tracker = str(system["tracker"])
-    args.tracker_project = str(system["tracker_project"])
-    args.tracker_workspace = str(system["tracker_workspace"])
-    return args
-
-
-def validate(parser, args):
-    for name, choices in CHOICES.items():
-        value = getattr(args, name)
-        if value is not None and value not in choices:
-            parser.error(f"invalid choice for {name}: {value!r}; choose from {', '.join(choices)}")
-    if (args.fused_adamw or args.cudnn_benchmark) and torch.device(args.device).type != "cuda":
-        parser.error("fused-adamw and cudnn-benchmark require a CUDA device")
-    if args.regularizer is None:
-        args.regularizer = "sigreg" if args.mode == "joint" else "none"
-    if (args.data is not None) == args.smoke_test:
-        parser.error("choose exactly one of data or smoke_test")
-    if args.output is None:
-        parser.error("output is required")
-    if args.epochs <= 0 or args.batch_size <= 0 or args.num_workers < 0:
-        parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
-    if args.max_steps is not None and args.max_steps <= 0:
-        parser.error("max-steps must be positive")
-    if args.accumulation_steps <= 0 or args.checkpoint_every <= 0 or args.benchmark_warmup < 0:
-        parser.error("accumulation-steps/checkpoint-every must be positive; benchmark-warmup nonnegative")
-    if args.max_seconds is not None and not 0 < args.max_seconds < float("inf"):
-        parser.error("max-seconds must be finite and positive")
-    if args.class_subset_count is not None and (
-        args.class_subset_count <= 0 or args.smoke_test or args.dataset != "imagefolder"
-    ):
-        parser.error("class-subset-count requires ImageFolder and a positive count")
-    if not 0 <= args.warmup_epochs < args.epochs:
-        parser.error("warmup-epochs must be nonnegative and less than epochs")
-    if not 0 <= args.ema_start <= args.ema_end <= 1:
-        parser.error("EMA must satisfy 0 <= ema-start <= ema-end <= 1")
-    if args.representation_data is not None and args.representation_samples < 2:
-        parser.error("representation-samples must be at least 2")
-    if not math.isfinite(args.regularizer_weight) or args.regularizer_weight < 0:
-        parser.error("regularizer-weight must be finite and nonnegative")
-    if args.mode == "ema" and args.regularizer != "none":
-        parser.error("regularization requires joint mode")
-    if args.mode == "joint" and args.regularizer != "none" and args.batch_size < 2:
-        parser.error("joint regularization requires batch-size >= 2")
-    if any(not 0 <= value < float("inf") for value in (
-        args.lr, args.start_lr, args.final_lr, args.weight_decay, args.final_weight_decay,
-    )):
-        parser.error("learning rates and weight decay must be finite and nonnegative")
 
 
 def run(parser, args):
@@ -291,7 +205,7 @@ def run(parser, args):
             regularizer_input="full-image encoder patch embeddings before target normalization",
             regularizer_reduction="mean over patch positions after regularizing across batch",
         )
-    for key in ("data", "output", "resume", "config"):
+    for key in ("data", "output", "resume"):
         value = getattr(args, key)
         if value is not None:
             config[key] = str(value.resolve())
@@ -583,12 +497,23 @@ def run(parser, args):
     experiment.end()
 
 
-@hydra.main(config_path="../configs_hydra", config_name="config", version_base="1.3")
+@hydra.main(config_path="../configs", config_name="config", version_base="1.3")
 def main(cfg):
     parser = argparse.ArgumentParser(description="Single-device I-JEPA training")
-    args = build_args(cfg)
-    validate(parser, args)
-    run(parser, args)
+    values = {
+        **OmegaConf.to_container(cfg.system, resolve=True),
+        **OmegaConf.to_container(cfg.training, resolve=True),
+    }
+    for key in PATHS:
+        if values[key] is not None:
+            values[key] = Path(str(values[key]))
+    for key in INTS:
+        if values[key] is not None:
+            values[key] = int(values[key])
+    for key in FLOATS:
+        if values[key] is not None:
+            values[key] = float(values[key])
+    run(parser, argparse.Namespace(**values))
 
 
 if __name__ == "__main__":
