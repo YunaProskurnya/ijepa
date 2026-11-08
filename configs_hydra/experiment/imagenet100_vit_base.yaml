@@ -1,23 +1,10 @@
 # @package _global_
 defaults:
+  - /recipe: in100_vit_base
   - override /system: default
 
 system:
   representation_data: null
 
 training:
-  collator: custom
-  model: vit_base
-  batch_size: 128
-  accumulation_steps: 1
   epochs: 10
-  warmup_epochs: 1
-  max_steps: null
-  lr: 6.25e-05
-  start_lr: 6.25e-06
-  final_lr: 6.25e-08
-  weight_decay: 0.04
-  final_weight_decay: 0.4
-  ema_start: 0.996
-  ema_end: 1
-  seed: 0

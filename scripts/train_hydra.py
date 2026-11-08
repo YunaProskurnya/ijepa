@@ -46,7 +46,7 @@ PATHS = ("data", "output", "resume", "representation_data")
 INTS = (
     "epochs", "batch_size", "num_workers", "max_steps", "accumulation_steps",
     "checkpoint_every", "benchmark_warmup", "class_subset_count", "seed",
-    "warmup_epochs", "representation_samples",
+    "warmup_epochs", "representation_samples", 
 )
 FLOATS = (
     "max_seconds", "lr", "start_lr", "final_lr", "weight_decay", "final_weight_decay",
