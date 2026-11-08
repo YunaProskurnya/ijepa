@@ -2,35 +2,69 @@ import argparse
 import csv
 import json
 import math
-import os
 from pathlib import Path
 import random
 import shutil
 import sys
 import time
 
-from comet_ml import start
-from comet_ml.integration.pytorch import log_model
+import hydra
 import numpy as np
 import PIL
 import torch
 import torchvision
+from omegaconf import OmegaConf
 from torchvision import datasets, transforms
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from src.datasets.imagenet100 import (
+    MaskCollator as CustomMaskCollator,
+    make_data_loader,
+)
 from src.models.encoder import VisionTransformer
 from src.models.predictor import VisionTransformerPredictor
 from src.models.target_encoder import create_target_encoder
-from src.config import parse_config_args
 from src.optimizer import create_optimizer
 from src.reference.multiblock import MaskCollator as ReferenceMaskCollator
-from src.datasets.imagenet100 import MaskCollator as CustomMaskCollator, make_data_loader
 from src.reference.schedulers import CosineWDSchedule, WarmupCosineSchedule
-from src.representation_diagnostics import CSV_FIELDS, evaluate_representation, make_representation_loader, save_representation
-from src.transforms import IMAGENET_NORMALIZE
+from src.representation_diagnostics import (
+    CSV_FIELDS,
+    evaluate_representation,
+    make_representation_loader,
+    save_representation,
+)
+from src.run_tracker import start_run_tracker
 from src.train_step import train_step
+from src.transforms import IMAGENET_NORMALIZE
+
+
+PATHS = ("data", "output", "resume", "representation_data")
+INTS = (
+    "epochs",
+    "batch_size",
+    "num_workers",
+    "max_steps",
+    "accumulation_steps",
+    "checkpoint_every",
+    "benchmark_warmup",
+    "class_subset_count",
+    "seed",
+    "warmup_epochs",
+    "representation_samples",
+)
+FLOATS = (
+    "max_seconds",
+    "lr",
+    "start_lr",
+    "final_lr",
+    "weight_decay",
+    "final_weight_decay",
+    "ema_start",
+    "ema_end",
+    "regularizer_weight",
+)
 
 
 def seed_worker(worker_id):
@@ -43,94 +77,15 @@ def resume_config(config):
     optimizer = config.get("optimizer")
     if optimizer is None:
         return config
-    defaults = {key: value for key, value in optimizer["defaults"].items()
-                if key not in ("fused", "foreach")}
+    defaults = {
+        key: value
+        for key, value in optimizer["defaults"].items()
+        if key not in ("fused", "foreach")
+    }
     return {**config, "optimizer": {**optimizer, "defaults": defaults}}
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Single-device I-JEPA training")
-    parser.add_argument("--config", type=Path, help="JSON experiment settings; CLI options take precedence")
-    parser.add_argument("--data", type=Path)
-    parser.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--dataset", choices=("imagefolder", "cifar10"), default="imagefolder")
-    parser.add_argument("--output", type=Path, default=ROOT / "runs" / "first-run")
-    parser.add_argument("--collator", choices=("custom", "reference"), default="custom")
-    parser.add_argument("--model", choices=("tiny", "vit_base", "vit_large"), default="tiny")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--accumulation-steps", type=int, default=1)
-    parser.add_argument("--checkpoint-every", type=int, default=100)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--max-seconds", type=float)
-    parser.add_argument("--benchmark-warmup", type=int, default=5)
-    parser.add_argument("--class-subset-count", type=int)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--start-lr", type=float, default=2e-4)
-    parser.add_argument("--final-lr", type=float, default=1e-6)
-    parser.add_argument("--warmup-epochs", type=int, default=0)
-    parser.add_argument("--weight-decay", type=float, default=0.04)
-    parser.add_argument("--final-weight-decay", type=float, default=0.4)
-    parser.add_argument("--ema-start", type=float, default=0.996)
-    parser.add_argument("--ema-end", type=float, default=1.0)
-    parser.add_argument("--representation-data", type=Path)
-    parser.add_argument("--representation-samples", type=int, default=1024)
-    parser.add_argument("--mode", choices=("ema", "joint"), default="ema")
-    parser.add_argument("--regularizer", choices=("none", "sigreg", "visreg"))
-    parser.add_argument("--regularizer-weight", type=float, default=0.02)
-    args = parse_config_args(parser, argv)
-    if (args.fused_adamw or args.cudnn_benchmark) and torch.device(args.device).type != "cuda":
-        parser.error("fused-adamw and cudnn-benchmark require a CUDA device")
-    if args.regularizer is None:
-        args.regularizer = "sigreg" if args.mode == "joint" else "none"
-    if (args.data is not None) == args.smoke_test:
-        parser.error("choose exactly one of --data or --smoke-test (in JSON or on the command line)")
-    if args.epochs <= 0 or args.batch_size <= 0 or args.num_workers < 0:
-        parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
-    if args.max_steps is not None and args.max_steps <= 0:
-        parser.error("max-steps must be positive")
-    if args.accumulation_steps <= 0 or args.checkpoint_every <= 0 or args.benchmark_warmup < 0:
-        parser.error("accumulation-steps/checkpoint-every must be positive; benchmark-warmup nonnegative")
-    if args.max_seconds is not None and not 0 < args.max_seconds < float("inf"):
-        parser.error("max-seconds must be finite and positive")
-    if args.class_subset_count is not None and (
-        args.class_subset_count <= 0 or args.smoke_test or args.dataset != "imagefolder"
-    ):
-        parser.error("class-subset-count requires ImageFolder and a positive count")
-    if not 0 <= args.warmup_epochs < args.epochs:
-        parser.error("warmup-epochs must be nonnegative and less than epochs")
-    if not 0 <= args.ema_start <= args.ema_end <= 1:
-        parser.error("EMA must satisfy 0 <= ema-start <= ema-end <= 1")
-    if args.representation_data is not None and args.representation_samples < 2:
-        parser.error("representation-samples must be at least 2")
-    if not math.isfinite(args.regularizer_weight) or args.regularizer_weight < 0:
-        parser.error("regularizer-weight must be finite and nonnegative")
-    if args.mode == "ema" and args.regularizer != "none":
-        parser.error("regularization requires joint mode")
-    if args.mode == "joint" and args.regularizer != "none" and args.batch_size < 2:
-        parser.error("joint regularization requires batch-size >= 2")
-    if any(not 0 <= value < float("inf") for value in (
-        args.lr, args.start_lr, args.final_lr, args.weight_decay, args.final_weight_decay,
-    )):
-        parser.error("learning rates and weight decay must be finite and nonnegative")
-
-    return parser, args
-
-
-def main():
-    parser, args = parse_args()
-
-    if not os.environ.get("COMET_API_KEY"):
-        parser.error("COMET_API_KEY is required; source .env before running")
-
+def run(parser, args):
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32))
     torch.manual_seed(args.seed)
@@ -149,17 +104,28 @@ def main():
     if device.type == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
 
-    crop_options = dict(size=224, scale=(0.3, 1.0), ratio=(0.75, 4 / 3),
-                        interpolation=transforms.InterpolationMode.BILINEAR, antialias=True)
-    transform = transforms.Compose([
-        transforms.RandomResizedCrop(**crop_options),
-        transforms.ToTensor(),
-        transforms.Normalize(**IMAGENET_NORMALIZE),
-    ])
+    crop_options = dict(
+        size=224,
+        scale=(0.3, 1.0),
+        ratio=(0.75, 4 / 3),
+        interpolation=transforms.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(**crop_options),
+            transforms.ToTensor(),
+            transforms.Normalize(**IMAGENET_NORMALIZE),
+        ]
+    )
     if args.smoke_test:
-        dataset = datasets.FakeData(size=8, image_size=(3, 256, 256), transform=transform)
+        dataset = datasets.FakeData(
+            size=8, image_size=(3, 256, 256), transform=transform
+        )
     elif args.dataset == "cifar10":
-        dataset = datasets.CIFAR10(str(args.data), train=True, transform=transform, download=False)
+        dataset = datasets.CIFAR10(
+            str(args.data), train=True, transform=transform, download=False
+        )
     else:
         dataset = datasets.ImageFolder(str(args.data), transform=transform)
 
@@ -168,30 +134,51 @@ def main():
         selected_classes = dataset.classes
         if args.class_subset_count is not None:
             if args.class_subset_count > len(dataset.classes):
-                parser.error("class-subset-count exceeds the number of ImageFolder classes")
+                parser.error(
+                    "class-subset-count exceeds the number of ImageFolder classes"
+                )
             selected = torch.randperm(
-                len(dataset.classes), generator=torch.Generator().manual_seed(args.seed),
-            )[:args.class_subset_count].tolist()
+                len(dataset.classes),
+                generator=torch.Generator().manual_seed(args.seed),
+            )[: args.class_subset_count].tolist()
             selected_classes = sorted(dataset.classes[index] for index in selected)
-            mapping = {dataset.class_to_idx[name]: index for index, name in enumerate(selected_classes)}
-            dataset.samples = [(path, mapping[label]) for path, label in dataset.samples if label in mapping]
+            mapping = {
+                dataset.class_to_idx[name]: index
+                for index, name in enumerate(selected_classes)
+            }
+            dataset.samples = [
+                (path, mapping[label])
+                for path, label in dataset.samples
+                if label in mapping
+            ]
             dataset.imgs = dataset.samples
             dataset.targets = [label for _, label in dataset.samples]
             dataset.classes = selected_classes
-            dataset.class_to_idx = {name: index for index, name in enumerate(selected_classes)}
+            dataset.class_to_idx = {
+                name: index for index, name in enumerate(selected_classes)
+            }
 
     mask_options = dict(
-        input_size=224, patch_size=16, enc_mask_scale=(0.85, 1.0),
-        pred_mask_scale=(0.15, 0.2), aspect_ratio=(0.75, 1.5),
-        nenc=1, npred=4, min_keep=10, allow_overlap=False,
+        input_size=224,
+        patch_size=16,
+        enc_mask_scale=(0.85, 1.0),
+        pred_mask_scale=(0.15, 0.2),
+        aspect_ratio=(0.75, 1.5),
+        nenc=1,
+        npred=4,
+        min_keep=10,
+        allow_overlap=False,
     )
     if args.collator == "reference":
         collator = ReferenceMaskCollator(**mask_options)
     else:
         if mask_options["nenc"] != 1 or mask_options["allow_overlap"]:
             parser.error("custom collator supports one context and allow_overlap=False")
-        custom_options = {key: value for key, value in mask_options.items()
-                          if key not in ("nenc", "npred", "allow_overlap")}
+        custom_options = {
+            key: value
+            for key, value in mask_options.items()
+            if key not in ("nenc", "npred", "allow_overlap")
+        }
         collator = CustomMaskCollator(**custom_options, M=mask_options["npred"])
     batches_per_epoch = len(dataset) // args.batch_size
     if batches_per_epoch == 0:
@@ -204,16 +191,33 @@ def main():
         "vit_large": (1024, 24, 16, 384, 12),
     }[args.model]
     transformer_options = dict(mlp_ratio=4.0, qkv_bias=True, drop=0.0, attn_drop=0.0)
-    model_options = dict(image_size=224, patch_size=16, in_channels=3, embed_dim=embed_dim,
-                         depth=depth, num_heads=num_heads, **transformer_options)
+    model_options = dict(
+        image_size=224,
+        patch_size=16,
+        in_channels=3,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        **transformer_options,
+    )
     encoder = VisionTransformer(**model_options).to(device)
-    predictor_options = dict(num_patches=encoder.num_patches, embed_dim=embed_dim,
-                             predictor_embed_dim=predictor_dim,
-                             depth=predictor_depth, num_heads=num_heads, **transformer_options)
+    predictor_options = dict(
+        num_patches=encoder.num_patches,
+        embed_dim=embed_dim,
+        predictor_embed_dim=predictor_dim,
+        depth=predictor_depth,
+        num_heads=num_heads,
+        **transformer_options,
+    )
     predictor = VisionTransformerPredictor(**predictor_options).to(device)
     target_encoder = create_target_encoder(encoder) if args.mode == "ema" else None
-    optimizer = create_optimizer(encoder, predictor, lr=args.lr, weight_decay=args.weight_decay,
-                                 fused=True if args.fused_adamw else None)
+    optimizer = create_optimizer(
+        encoder,
+        predictor,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        fused=True if args.fused_adamw else None,
+    )
     encoder.train()
     predictor.train()
     if target_encoder is not None:
@@ -222,62 +226,117 @@ def main():
     representation_loader = None
     if args.representation_data is not None:
         representation_paths, representation_loader = make_representation_loader(
-            args.representation_data, model_options["image_size"], args.representation_samples,
-            args.seed, 32, device,
+            args.representation_data,
+            model_options["image_size"],
+            args.representation_samples,
+            args.seed,
+            32,
+            device,
         )
         if len(representation_paths) < 2:
             parser.error("representation-data must contain at least two images")
 
     total_steps = args.epochs * updates_per_epoch
     lr_schedule = WarmupCosineSchedule(
-        optimizer, warmup_steps=args.warmup_epochs * updates_per_epoch,
-        start_lr=args.start_lr, ref_lr=args.lr, final_lr=args.final_lr, T_max=total_steps,
+        optimizer,
+        warmup_steps=args.warmup_epochs * updates_per_epoch,
+        start_lr=args.start_lr,
+        ref_lr=args.lr,
+        final_lr=args.final_lr,
+        T_max=total_steps,
     )
     wd_schedule = CosineWDSchedule(
-        optimizer, ref_wd=args.weight_decay, final_wd=args.final_weight_decay, T_max=total_steps,
+        optimizer,
+        ref_wd=args.weight_decay,
+        final_wd=args.final_weight_decay,
+        T_max=total_steps,
     )
-    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    config.update(encoder=model_options, predictor=predictor_options, masks=mask_options,
-                  total_steps=total_steps, torch_version=str(torch.__version__),
-                  resolved_device=str(device), cuda_version=torch.version.cuda,
-                  gpu_name=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-                  gpu_memory_bytes=torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else None,
-                  images=len(dataset), selected_classes=selected_classes,
-                  batches_per_epoch=batches_per_epoch, updates_per_epoch=updates_per_epoch,
-                  effective_batch_size=args.batch_size * args.accumulation_steps,
-                  reference_commit="52c1ae95d05f743e000e8f10a1f3a79b10cff048")
-    # Record fixed settings as well as editable flags: checkpoints are self-describing.
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    config.update(
+        encoder=model_options,
+        predictor=predictor_options,
+        masks=mask_options,
+        total_steps=total_steps,
+        torch_version=str(torch.__version__),
+        resolved_device=str(device),
+        cuda_version=torch.version.cuda,
+        gpu_name=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        gpu_memory_bytes=torch.cuda.get_device_properties(device).total_memory
+        if device.type == "cuda"
+        else None,
+        images=len(dataset),
+        selected_classes=selected_classes,
+        batches_per_epoch=batches_per_epoch,
+        updates_per_epoch=updates_per_epoch,
+        effective_batch_size=args.batch_size * args.accumulation_steps,
+        reference_commit="52c1ae95d05f743e000e8f10a1f3a79b10cff048",
+    )
     config.update(
         preprocessing=dict(
-            random_resized_crop={**crop_options, "interpolation": crop_options["interpolation"].value},
-            to_tensor=True, normalize=IMAGENET_NORMALIZE,
+            random_resized_crop={
+                **crop_options,
+                "interpolation": crop_options["interpolation"].value,
+            },
+            to_tensor=True,
+            normalize=IMAGENET_NORMALIZE,
         ),
-        optimizer=dict(name="AdamW", defaults=optimizer.defaults,
-                       no_decay="parameter name contains 'bias' or parameter.ndim == 1"),
-        objective=dict(loss="smooth_l1", beta=1.0, reduction="mean per block, then mean across blocks",
-                       target_normalization="layer_norm over features", target_norm_eps=1e-5,
-                       target_update="EMA after optimizer.step" if args.mode == "ema" else "joint shared encoder",
-                       gradient_clipping=None),
-        schedules=dict(lr="warmup_cosine", weight_decay="cosine",
-                       ema="linear" if args.mode == "ema" else "none",
-                       unit="optimizer update", warmup_steps=args.warmup_epochs * updates_per_epoch,
-                       total_steps=total_steps),
-        architecture=dict(position_embedding="fixed_2d_sincos", layer_norm_eps=1e-6,
-                          initialization_std=0.02, residual_rescale="1 / sqrt(2 * layer_index)",
-                          attention="scaled_dot_product_attention", stochastic_depth=0.0),
-        data_loader=dict(drop_last=True, persistent_workers=False,
-                         sampler="randperm with seed + epoch", pin_memory=device.type == "cuda"),
+        optimizer=dict(
+            name="AdamW",
+            defaults=optimizer.defaults,
+            no_decay="parameter name contains 'bias' or parameter.ndim == 1",
+        ),
+        objective=dict(
+            loss="smooth_l1",
+            beta=1.0,
+            reduction="mean per block, then mean across blocks",
+            target_normalization="layer_norm over features",
+            target_norm_eps=1e-5,
+            target_update="EMA after optimizer.step"
+            if args.mode == "ema"
+            else "joint shared encoder",
+            gradient_clipping=None,
+        ),
+        schedules=dict(
+            lr="warmup_cosine",
+            weight_decay="cosine",
+            ema="linear" if args.mode == "ema" else "none",
+            unit="optimizer update",
+            warmup_steps=args.warmup_epochs * updates_per_epoch,
+            total_steps=total_steps,
+        ),
+        architecture=dict(
+            position_embedding="fixed_2d_sincos",
+            layer_norm_eps=1e-6,
+            initialization_std=0.02,
+            residual_rescale="1 / sqrt(2 * layer_index)",
+            attention="scaled_dot_product_attention",
+            stochastic_depth=0.0,
+        ),
+        data_loader=dict(
+            drop_last=True,
+            persistent_workers=False,
+            sampler="randperm with seed + epoch",
+            pin_memory=device.type == "cuda",
+        ),
         smoke_data=dict(size=8, image_size=(3, 256, 256)) if args.smoke_test else None,
-        versions=dict(python=sys.version.split()[0], torchvision=str(torchvision.__version__),
-                      numpy=np.__version__, pillow=PIL.__version__),
+        versions=dict(
+            python=sys.version.split()[0],
+            torchvision=str(torchvision.__version__),
+            numpy=np.__version__,
+            pillow=PIL.__version__,
+        ),
     )
     if args.mode == "joint":
         config["objective"].update(
-            regularizer=args.regularizer, regularizer_weight=args.regularizer_weight,
+            regularizer=args.regularizer,
+            regularizer_weight=args.regularizer_weight,
             regularizer_input="full-image encoder patch embeddings before target normalization",
             regularizer_reduction="mean over patch positions after regularizing across batch",
         )
-    for key in ("data", "output", "resume", "config"):
+    for key in ("data", "output", "resume"):
         value = getattr(args, key)
         if value is not None:
             config[key] = str(value.resolve())
@@ -290,29 +349,70 @@ def main():
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
         compatible = (
-            "encoder", "predictor", "masks", "model", "dataset", "data", "smoke_test", "collator",
-            "images", "selected_classes", "batch_size", "accumulation_steps", "epochs", "seed",
-            "precision", "lr", "start_lr", "final_lr", "warmup_epochs", "weight_decay",
-            "final_weight_decay", "ema_start", "ema_end", "mode", "regularizer",
-            "regularizer_weight", "total_steps", "representation_data", "representation_samples",
-            "preprocessing", "optimizer", "objective", "schedules", "architecture", "smoke_data",
+            "encoder",
+            "predictor",
+            "masks",
+            "model",
+            "dataset",
+            "data",
+            "smoke_test",
+            "collator",
+            "images",
+            "selected_classes",
+            "batch_size",
+            "accumulation_steps",
+            "epochs",
+            "seed",
+            "precision",
+            "lr",
+            "start_lr",
+            "final_lr",
+            "warmup_epochs",
+            "weight_decay",
+            "final_weight_decay",
+            "ema_start",
+            "ema_end",
+            "mode",
+            "regularizer",
+            "regularizer_weight",
+            "total_steps",
+            "representation_data",
+            "representation_samples",
+            "preprocessing",
+            "optimizer",
+            "objective",
+            "schedules",
+            "architecture",
+            "smoke_data",
         )
-        defaults = dict(mode="ema", regularizer="none", regularizer_weight=0.02,
-                        representation_data=None, representation_samples=1024)
+        defaults = dict(
+            mode="ema",
+            regularizer="none",
+            regularizer_weight=0.02,
+            representation_data=None,
+            representation_samples=1024,
+        )
         saved_config = resume_config(checkpoint["config"])
         requested_config = resume_config(config)
-        differences = [key for key in compatible
-                       if saved_config.get(key, defaults.get(key)) != requested_config.get(key)]
+        differences = [
+            key
+            for key in compatible
+            if saved_config.get(key, defaults.get(key)) != requested_config.get(key)
+        ]
         if differences:
             parser.error("resume configuration differs: " + ", ".join(differences))
         if "next_batch" not in checkpoint:
-            parser.error("checkpoint lacks resume progress; use a checkpoint from this launcher version")
+            parser.error(
+                "checkpoint lacks resume progress; use a checkpoint from this launcher version"
+            )
         encoder.load_state_dict(checkpoint["encoder"])
         predictor.load_state_dict(checkpoint["predictor"])
         if target_encoder is not None:
             target_encoder.load_state_dict(checkpoint["target_encoder"])
         for group in checkpoint["optimizer"]["param_groups"]:
-            group.update(fused=optimizer.defaults["fused"], foreach=optimizer.defaults["foreach"])
+            group.update(
+                fused=optimizer.defaults["fused"], foreach=optimizer.defaults["foreach"]
+            )
         optimizer.load_state_dict(checkpoint["optimizer"])
         step = checkpoint["step"]
         next_epoch = checkpoint["next_epoch"]
@@ -323,18 +423,32 @@ def main():
         torch.set_rng_state(checkpoint["torch_rng_state"])
         random.setstate(checkpoint["python_rng_state"])
         numpy_state = checkpoint["numpy_rng_state"]
-        np.random.set_state((numpy_state[0], np.array(numpy_state[1], dtype=np.uint32), *numpy_state[2:]))
+        np.random.set_state(
+            (
+                numpy_state[0],
+                np.array(numpy_state[1], dtype=np.uint32),
+                *numpy_state[2:],
+            )
+        )
         if device.type == "cuda" and checkpoint["cuda_rng_states"]:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
         collator._itr_counter.value = microbatches_seen - 1
-        print(f"Resuming after optimizer update {step}; worker prefetch/masks are not bitwise replayed.", flush=True)
+        print(
+            f"Resuming after optimizer update {step}; worker prefetch/masks are not bitwise replayed.",
+            flush=True,
+        )
         del checkpoint
 
     if args.output.exists() and not args.resume:
         parser.error("output already exists; choose a new directory or pass --resume")
     if args.output.exists() and args.resume and (args.output / "config.json").exists():
-        previous_config = resume_config(json.loads((args.output / "config.json").read_text(encoding="utf-8")))
-        if any(previous_config.get(key, defaults.get(key)) != requested_config.get(key) for key in compatible):
+        previous_config = resume_config(
+            json.loads((args.output / "config.json").read_text(encoding="utf-8"))
+        )
+        if any(
+            previous_config.get(key, defaults.get(key)) != requested_config.get(key)
+            for key in compatible
+        ):
             parser.error("existing output directory belongs to an incompatible run")
     if args.compile:
         encoder.compile(dynamic=True, mode="default")
@@ -342,41 +456,78 @@ def main():
     representation_every = 25
     representation_output = args.output / "representation_analysis"
     if representation_loader is not None:
-        representation_settings = dict(paths=representation_paths, every=representation_every,
-                                       encoder_source="encoder" if args.mode == "joint" else "target_encoder")
+        representation_settings = dict(
+            paths=representation_paths,
+            every=representation_every,
+            encoder_source="encoder" if args.mode == "joint" else "target_encoder",
+        )
         if args.mode == "joint":
-            representation_settings.update(regularizer=args.regularizer,
-                                           regularizer_weight=args.regularizer_weight)
+            representation_settings.update(
+                regularizer=args.regularizer, regularizer_weight=args.regularizer_weight
+            )
         settings_path = representation_output / "settings.json"
         if settings_path.exists():
             previous = json.loads(settings_path.read_text(encoding="utf-8"))
-            if any(previous.get(key, value) != value for key, value in representation_settings.items()):
-                parser.error("representation analysis settings differ; choose another --output")
+            if any(
+                previous.get(key, value) != value
+                for key, value in representation_settings.items()
+            ):
+                parser.error(
+                    "representation analysis settings differ; choose another --output"
+                )
     args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (args.output / "config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
     if representation_loader is not None:
         representation_output.mkdir(exist_ok=True)
-        settings_path.write_text(json.dumps(representation_settings, indent=2), encoding="utf-8")
-    experiment = start(api_key=os.environ["COMET_API_KEY"], project_name="rejepa", workspace="superustam")
+        settings_path.write_text(
+            json.dumps(representation_settings, indent=2), encoding="utf-8"
+        )
+    experiment = start_run_tracker(
+        args.tracker,
+        project=args.tracker_project,
+        workspace=args.tracker_workspace,
+        task_name=Path(str(args.output)).name,
+    )
     experiment.log_parameters(config)
     if args.smoke_test:
-        print("Synthetic images: checks execution only, not representation quality.", flush=True)
-    print(f"model={args.model} collator={args.collator} device={device} precision={args.precision} images={len(dataset)} "
-          f"classes={len(selected_classes) if selected_classes is not None else 'n/a'} "
-          f"updates_per_epoch={updates_per_epoch} effective_batch={config['effective_batch_size']}", flush=True)
+        print(
+            "Synthetic images: checks execution only, not representation quality.",
+            flush=True,
+        )
+    print(
+        f"model={args.model} collator={args.collator} device={device} precision={args.precision} images={len(dataset)} "
+        f"classes={len(selected_classes) if selected_classes is not None else 'n/a'} "
+        f"updates_per_epoch={updates_per_epoch} effective_batch={config['effective_batch_size']}",
+        flush=True,
+    )
 
     def save_checkpoint(completed_epoch=None):
         numpy_state = np.random.get_state()
         temporary = args.output / "checkpoint.tmp"
         checkpoint = {
-            "encoder": encoder.state_dict(), "predictor": predictor.state_dict(),
+            "encoder": encoder.state_dict(),
+            "predictor": predictor.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "step": step, "epoch": next_epoch + int(next_batch > 0), "config": config,
-            "next_epoch": next_epoch, "next_batch": next_batch, "microbatches_seen": microbatches_seen,
-            "lr_schedule_step": lr_schedule._step, "wd_schedule_step": wd_schedule._step,
-            "torch_rng_state": torch.get_rng_state(), "python_rng_state": random.getstate(),
-            "numpy_rng_state": (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
-            "cuda_rng_states": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
+            "step": step,
+            "epoch": next_epoch + int(next_batch > 0),
+            "config": config,
+            "next_epoch": next_epoch,
+            "next_batch": next_batch,
+            "microbatches_seen": microbatches_seen,
+            "lr_schedule_step": lr_schedule._step,
+            "wd_schedule_step": wd_schedule._step,
+            "torch_rng_state": torch.get_rng_state(),
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": (
+                numpy_state[0],
+                numpy_state[1].tolist(),
+                *numpy_state[2:],
+            ),
+            "cuda_rng_states": torch.cuda.get_rng_state_all()
+            if device.type == "cuda"
+            else [],
         }
         if target_encoder is not None:
             checkpoint["target_encoder"] = target_encoder.state_dict()
@@ -389,47 +540,83 @@ def main():
 
     representation_csv = representation_output / "representations.csv"
     completed_representations = set()
-    if representation_loader is not None and args.resume and representation_csv.exists():
+    if (
+        representation_loader is not None
+        and args.resume
+        and representation_csv.exists()
+    ):
         with representation_csv.open(newline="", encoding="utf-8") as stream:
-            previous_representations = [row for row in csv.DictReader(stream)
-                                        if int(row["epoch"]) < next_epoch
-                                        and (representation_output / row["artifact"]).exists()]
+            previous_representations = [
+                row
+                for row in csv.DictReader(stream)
+                if int(row["epoch"]) < next_epoch
+                and (representation_output / row["artifact"]).exists()
+            ]
         with representation_csv.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
             writer.writeheader()
             writer.writerows(previous_representations)
-        completed_representations = {int(row["epoch"]) for row in previous_representations}
+        completed_representations = {
+            int(row["epoch"]) for row in previous_representations
+        }
 
     def record_representation(epoch):
         if representation_loader is None or epoch in completed_representations:
             return
-        if epoch not in (0, args.epochs - 1) and (epoch + 1) % representation_every != 0:
+        if (
+            epoch not in (0, args.epochs - 1)
+            and (epoch + 1) % representation_every != 0
+        ):
             return
         representation_encoder = encoder if args.mode == "joint" else target_encoder
         representation_encoder.eval()
-        statistics = evaluate_representation(representation_encoder, representation_loader, device,
-                                             args.precision == "bf16")
+        statistics = evaluate_representation(
+            representation_encoder,
+            representation_loader,
+            device,
+            args.precision == "bf16",
+        )
         representation_encoder.train()
         save_representation(representation_output, epoch, step, statistics)
         completed_representations.add(epoch)
-        print(f"epoch {epoch + 1}: rank={statistics['effective_rank']:.2f} "
-              f"entropy={statistics['singular_entropy']:.3f} "
-              f"variance={statistics['mean_variance']:.6f}", flush=True)
+        print(
+            f"epoch {epoch + 1}: rank={statistics['effective_rank']:.2f} "
+            f"entropy={statistics['singular_entropy']:.3f} "
+            f"variance={statistics['mean_variance']:.6f}",
+            flush=True,
+        )
 
     if args.resume and next_epoch > 0 and next_batch == 0:
         record_representation(next_epoch - 1)
 
     fieldnames = [
-        "step", "epoch", "loss", "prediction_loss", "regularization_loss", "grad_norm",
-        "lr", "weight_decay", "momentum", "context_tokens", "target_tokens",
-        "images", "step_seconds", "images_per_second", "steady_images_per_second", "eta_seconds",
-        "cuda_peak_memory_mb", "elapsed_seconds", "warmup",
+        "step",
+        "epoch",
+        "loss",
+        "prediction_loss",
+        "regularization_loss",
+        "grad_norm",
+        "lr",
+        "weight_decay",
+        "momentum",
+        "context_tokens",
+        "target_tokens",
+        "images",
+        "step_seconds",
+        "images_per_second",
+        "steady_images_per_second",
+        "eta_seconds",
+        "cuda_peak_memory_mb",
+        "elapsed_seconds",
+        "warmup",
     ]
     log_path = args.output / "metrics.csv"
     previous_rows = []
     if args.resume and log_path.exists():
         with log_path.open(newline="", encoding="utf-8") as previous:
-            previous_rows = [row for row in csv.DictReader(previous) if int(row["step"]) <= step]
+            previous_rows = [
+                row for row in csv.DictReader(previous) if int(row["step"]) <= step
+            ]
     session_start = time.perf_counter()
     measured_images = 0
     measured_seconds = 0.0
@@ -446,19 +633,28 @@ def main():
             if stop:
                 break
             permutation = torch.randperm(
-                len(dataset), generator=torch.Generator().manual_seed(args.seed + epoch),
+                len(dataset),
+                generator=torch.Generator().manual_seed(args.seed + epoch),
             ).tolist()
             first_batch = next_batch if epoch == next_epoch else 0
             loader = make_data_loader(
-                dataset, batch_size=args.batch_size, sampler=permutation[first_batch * args.batch_size:],
-                drop_last=True, num_workers=args.num_workers, collator=collator,
-                generator=torch.Generator().manual_seed(args.seed + epoch), worker_init_fn=seed_worker,
+                dataset,
+                batch_size=args.batch_size,
+                sampler=permutation[first_batch * args.batch_size :],
+                drop_last=True,
+                num_workers=args.num_workers,
+                collator=collator,
+                generator=torch.Generator().manual_seed(args.seed + epoch),
+                worker_init_fn=seed_worker,
                 pin_mem=device.type == "cuda",
             )
             iterator = iter(loader)
             batch_index = first_batch
             while batch_index < batches_per_epoch:
-                if args.max_seconds is not None and time.perf_counter() - session_start >= args.max_seconds:
+                if (
+                    args.max_seconds is not None
+                    and time.perf_counter() - session_start >= args.max_seconds
+                ):
                     stop = True
                     stop_reason = "max-seconds reached at an optimizer-update boundary"
                     break
@@ -466,11 +662,17 @@ def main():
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
                 started = time.perf_counter()
-                group_size = min(args.accumulation_steps, batches_per_epoch - batch_index)
+                group_size = min(
+                    args.accumulation_steps, batches_per_epoch - batch_index
+                )
                 lr = lr_schedule.step()
                 weight_decay = wd_schedule.step()
-                momentum = (args.ema_start + (args.ema_end - args.ema_start) * step / total_steps
-                            if args.mode == "ema" else None)
+                momentum = (
+                    args.ema_start
+                    + (args.ema_end - args.ema_start) * step / total_steps
+                    if args.mode == "ema"
+                    else None
+                )
                 loss_sum = 0.0
                 prediction_sum = 0.0
                 regularization_sum = 0.0
@@ -480,13 +682,25 @@ def main():
                     batch, context_masks, target_masks = next(iterator)
                     images = batch[0].to(device, non_blocking=True)
                     context_indices = context_masks[0].to(device, non_blocking=True)
-                    target_indices = [indices.to(device, non_blocking=True) for indices in target_masks]
+                    target_indices = [
+                        indices.to(device, non_blocking=True)
+                        for indices in target_masks
+                    ]
                     metrics = train_step(
-                        encoder, predictor, target_encoder, optimizer,
-                        images, context_indices, target_indices, momentum,
-                        precision=args.precision, accumulation_steps=group_size,
-                        zero_grad=microstep == 0, update=microstep == group_size - 1,
-                        mode=args.mode, regularizer=args.regularizer,
+                        encoder,
+                        predictor,
+                        target_encoder,
+                        optimizer,
+                        images,
+                        context_indices,
+                        target_indices,
+                        momentum,
+                        precision=args.precision,
+                        accumulation_steps=group_size,
+                        zero_grad=microstep == 0,
+                        update=microstep == group_size - 1,
+                        mode=args.mode,
+                        regularizer=args.regularizer,
                         regularizer_weight=args.regularizer_weight,
                     )
                     loss_sum += metrics["loss"]
@@ -508,37 +722,56 @@ def main():
                 if not warmup:
                     measured_images += update_images
                     measured_seconds += seconds
-                throughput = measured_images / measured_seconds if measured_seconds else None
+                throughput = (
+                    measured_images / measured_seconds if measured_seconds else None
+                )
                 remaining_images = (
                     (args.epochs - next_epoch) * batches_per_epoch - next_batch
                 ) * args.batch_size
                 row = dict(
-                    step=step, epoch=epoch + 1, loss=loss_sum / group_size,
+                    step=step,
+                    epoch=epoch + 1,
+                    loss=loss_sum / group_size,
                     prediction_loss=prediction_sum / group_size,
                     regularization_loss=regularization_sum / group_size,
                     grad_norm=metrics["grad_norm"],
-                    lr=lr, weight_decay=weight_decay, momentum=momentum,
-                    context_tokens=context_sum / group_size, target_tokens=target_sum / group_size,
-                    images=update_images, step_seconds=seconds, images_per_second=update_images / seconds,
-                    steady_images_per_second=throughput, eta_seconds=remaining_images / throughput if throughput else None,
-                    cuda_peak_memory_mb=torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0,
-                    elapsed_seconds=time.perf_counter() - session_start, warmup=warmup,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    momentum=momentum,
+                    context_tokens=context_sum / group_size,
+                    target_tokens=target_sum / group_size,
+                    images=update_images,
+                    step_seconds=seconds,
+                    images_per_second=update_images / seconds,
+                    steady_images_per_second=throughput,
+                    eta_seconds=remaining_images / throughput if throughput else None,
+                    cuda_peak_memory_mb=torch.cuda.max_memory_allocated(device) / 2**20
+                    if device.type == "cuda"
+                    else 0,
+                    elapsed_seconds=time.perf_counter() - session_start,
+                    warmup=warmup,
                 )
                 if group_size == 1:
                     row["context_tokens"] = int(row["context_tokens"])
                     row["target_tokens"] = int(row["target_tokens"])
                 writer.writerow(row)
                 log.flush()
-                experiment.log_metrics({key: value for key, value in row.items() if value is not None},
-                                       step=step, epoch=epoch + 1)
-                print(f"step={step} epoch={epoch + 1} loss={row['loss']:.6f} "
-                      f"prediction={row['prediction_loss']:.6f} regularization={row['regularization_loss']:.6f} "
-                      f"context={row['context_tokens']:g} target={row['target_tokens']:g} "
-                      f"lr={lr:.6g} "
-                      f"{'ema=' + format(momentum, '.6f') if momentum is not None else 'mode=joint'} "
-                      f"seconds={seconds:.3f} "
-                      f"images/s={row['images_per_second']:.1f} warmup={warmup} "
-                      f"cuda_mb={row['cuda_peak_memory_mb']:.0f}", flush=True)
+                experiment.log_metrics(
+                    {key: value for key, value in row.items() if value is not None},
+                    step=step,
+                    epoch=epoch + 1,
+                )
+                print(
+                    f"step={step} epoch={epoch + 1} loss={row['loss']:.6f} "
+                    f"prediction={row['prediction_loss']:.6f} regularization={row['regularization_loss']:.6f} "
+                    f"context={row['context_tokens']:g} target={row['target_tokens']:g} "
+                    f"lr={lr:.6g} "
+                    f"{'ema=' + format(momentum, '.6f') if momentum is not None else 'mode=joint'} "
+                    f"seconds={seconds:.3f} "
+                    f"images/s={row['images_per_second']:.1f} warmup={warmup} "
+                    f"cuda_mb={row['cuda_peak_memory_mb']:.0f}",
+                    flush=True,
+                )
                 if step % args.checkpoint_every == 0:
                     save_checkpoint()
                 if args.max_steps is not None and step >= args.max_steps:
@@ -554,14 +787,39 @@ def main():
             save_checkpoint()
     print(f"Stopped: {stop_reason}", flush=True)
     if measured_seconds:
-        print(f"Steady throughput excluding {args.benchmark_warmup} warmup updates and checkpoint writes: "
-              f"{measured_images / measured_seconds:.2f} images/s", flush=True)
-    print(f"Saved configuration, metrics and checkpoint to {args.output.resolve()}", flush=True)
+        print(
+            f"Steady throughput excluding {args.benchmark_warmup} warmup updates and checkpoint writes: "
+            f"{measured_images / measured_seconds:.2f} images/s",
+            flush=True,
+        )
+    print(
+        f"Saved configuration, metrics and checkpoint to {args.output.resolve()}",
+        flush=True,
+    )
     model_state = {"encoder": encoder.state_dict(), "predictor": predictor.state_dict()}
     if target_encoder is not None:
         model_state["target_encoder"] = target_encoder.state_dict()
-    log_model(experiment, model_state, model_name="rejepa")
+    experiment.log_model(model_state, model_name="rejepa")
     experiment.end()
+
+
+@hydra.main(config_path="../configs", config_name="config", version_base="1.3")
+def main(cfg):
+    parser = argparse.ArgumentParser(description="Single-device I-JEPA training")
+    values = {
+        **OmegaConf.to_container(cfg.system, resolve=True),
+        **OmegaConf.to_container(cfg.training, resolve=True),
+    }
+    for key in PATHS:
+        if values[key] is not None:
+            values[key] = Path(str(values[key]))
+    for key in INTS:
+        if values[key] is not None:
+            values[key] = int(values[key])
+    for key in FLOATS:
+        if values[key] is not None:
+            values[key] = float(values[key])
+    run(parser, argparse.Namespace(**values))
 
 
 if __name__ == "__main__":
