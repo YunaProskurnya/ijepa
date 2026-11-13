@@ -129,6 +129,9 @@ loss: у авторов `(1−λ)·prediction + λ·regularization`, у нас
 Режим и регуляризатор нельзя менять при продолжении запуска. Формулы описаны
 в [src/regularizers/README.md](src/regularizers/README.md).
 
+Конфиг SIGReg для Kaggle: [kaggle_sigreg_400ep.json](configs/kaggle_sigreg_400ep.json),
+вес `0.02`, результаты — `/kaggle/working/runs/sigreg`.
+
 По умолчанию используется collator команды: `--collator custom`, реализация
 в `src/datasets/imagenet100.py`. Авторский вариант включается через
 `--collator reference`. Оба возвращают одинаковый формат батча, поэтому encoder,
